@@ -2,292 +2,217 @@ package timedmap
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-type callback func(value interface{})
+type Callback func(value interface{})
 
-// TimedMap contains a map with all key-value pairs,
-// and a timer, which cleans the map in the set
-// tick durations from expired keys.
-type TimedMap struct {
-	mtx             sync.RWMutex
-	container       map[keyWrap]*element
-	cleanupTickTime time.Duration
-	cleaner         *time.Ticker
-	cleanerStopChan chan bool
+type Map interface {
+	Set(key, value interface{}, expiresAfter time.Duration, cb ...Callback)
+	GetValue(key interface{}) interface{}
+	GetExpires(key interface{}) (time.Time, error)
+	SetExpire(key interface{}, d time.Duration) error
+	Refresh(key interface{}, d time.Duration) error
+	Contains(key interface{}) bool
+	Remove(key interface{})
+	Flush()
+	Size() int
 }
 
-type keyWrap struct {
-	sec int
-	key interface{}
+type TimedMap interface {
+	Map
+
+	StartCleaner(interval time.Duration)
+	StopCleaner()
 }
 
-// element contains the actual value as interface type,
-// the thime when the value expires and an array of
-// callbacks, which will be executed when the element
-// expires.
-type element struct {
-	value   interface{}
-	expires time.Time
-	cbs     []callback
+////////////////////
+// IMPLEMENTATION
+
+type timedMap struct {
+	m              *sync.Map
+	valuePool      *sync.Pool
+	size           int64
+	cleanupRunning bool
+	cStopCleanup   chan struct{}
 }
 
-// New creates and returns a new instance of TimedMap.
-// The passed cleanupTickTime will be passed to the
-// cleanup Timer, which iterates through the map and
-// deletes expired key-value pairs.
-//
-// Optionally, you can also pass a custom <-chan time.Time
-// which controls the cleanup cycle if you want to use
-// a single syncronyzed timer or somethign like that.
-func New(cleanupTickTime time.Duration, tickerChan ...<-chan time.Time) *TimedMap {
-	tm := &TimedMap{
-		container:       make(map[keyWrap]*element),
-		cleanerStopChan: make(chan bool),
+type valueWrapper struct {
+	val interface{}
+	exp time.Time
+	cb  Callback
+}
+
+func New(cleanupInterval time.Duration) TimedMap {
+	t := &timedMap{
+		m: &sync.Map{},
+		valuePool: &sync.Pool{
+			New: func() interface{} {
+				return &valueWrapper{}
+			},
+		},
+		cStopCleanup: make(chan struct{}),
 	}
 
-	var tc <-chan time.Time
-	if len(tickerChan) > 0 {
-		tc = tickerChan[0]
+	t.StartCleaner(cleanupInterval)
+
+	return t
+}
+
+func (t *timedMap) Set(key, value interface{}, expiresAfter time.Duration, cb ...Callback) {
+	vw, ok := t.get(key)
+	if !ok {
+		vw = t.valuePool.Get().(*valueWrapper)
+		atomic.AddInt64(&t.size, 1)
+	}
+
+	vw.val = value
+	vw.exp = time.Now().Add(expiresAfter)
+	if len(cb) > 0 {
+		vw.cb = cb[0]
 	} else {
-		tm.cleaner = time.NewTicker(cleanupTickTime)
-		tc = tm.cleaner.C
+		vw.cb = nil
 	}
 
-	go func() {
-		for {
-			select {
-			case <-tc:
-				tm.cleanUp()
-			case <-tm.cleanerStopChan:
-				break
-			}
-		}
-	}()
-
-	return tm
+	t.m.Store(key, vw)
 }
 
-// Section returns a sectioned subset of
-// the timed map with the given section
-// identifier i.
-func (tm *TimedMap) Section(i int) Section {
-	return newSection(tm, i)
-}
-
-// Ident returns the current sections ident.
-// In the case of the root object TimedMap,
-// this is always 0.
-func (tm *TimedMap) Ident() int {
-	return 0
-}
-
-// Set appends a key-value pair to the map or sets the value of
-// a key. expiresAfter sets the expire time after the key-value pair
-// will automatically be removed from the map.
-func (tm *TimedMap) Set(key, value interface{}, expiresAfter time.Duration, cb ...callback) {
-	tm.set(key, 0, value, expiresAfter, cb...)
-}
-
-// GetValue returns an interface of the value of a key in the
-// map. The returned value is nil if there is no value to the
-// passed key or if the value was expired.
-func (tm *TimedMap) GetValue(key interface{}) interface{} {
-	v := tm.get(key, 0)
-	if v == nil {
-		return nil
-	}
-	return v.value
-}
-
-// GetExpires returns the expire time of a key-value pair.
-// If the key-value pair does not exist in the map or
-// was expired, this will return an error object.
-func (tm *TimedMap) GetExpires(key interface{}) (time.Time, error) {
-	v := tm.get(key, 0)
-	if v == nil {
-		return time.Time{}, ErrKeyNotFound
-	}
-	return v.expires, nil
-}
-
-// SetExpires sets the expire time for a key-value
-// pair to the passed duration. If there is no value
-// to the key passed , this will return an error.
-func (tm *TimedMap) SetExpire(key interface{}, d time.Duration) error {
-	return tm.setExpire(key, 0, d)
-}
-
-// Contains returns true, if the key exists in the map.
-// false will be returned, if there is no value to the
-// key or if the key-value pair was expired.
-func (tm *TimedMap) Contains(key interface{}) bool {
-	return tm.get(key, 0) != nil
-}
-
-// Remove deletes a key-value pair in the map.
-func (tm *TimedMap) Remove(key interface{}) {
-	tm.remove(key, 0)
-}
-
-// Refresh extends the expire time for a key-value pair
-// about the passed duration. If there is no value to
-// the key passed, this will return an error object.
-func (tm *TimedMap) Refresh(key interface{}, d time.Duration) error {
-	return tm.refresh(key, 0, d)
-}
-
-// Flush deletes all key-value pairs of the map.
-func (tm *TimedMap) Flush() {
-	tm.container = make(map[keyWrap]*element)
-}
-
-// Size returns the current number of key-value pairs
-// existent in the map.
-func (tm *TimedMap) Size() int {
-	return len(tm.container)
-}
-
-// StopCleaner stops the cleaner go routine and timer.
-// This should always be called after exiting a scope
-// where TimedMap is used that the data can be cleaned
-// up correctly.
-func (tm *TimedMap) StopCleaner() {
-	go func() {
-		tm.cleanerStopChan <- true
-	}()
-	if tm.cleaner != nil {
-		tm.cleaner.Stop()
-	}
-}
-
-// expireElement removes the specified key-value element
-// from the map and executes all defined callback functions
-func (tm *TimedMap) expireElement(key interface{}, sec int, v *element) {
-	for _, cb := range v.cbs {
-		cb(v.value)
-	}
-
-	k := keyWrap{
-		sec: sec,
-		key: key,
-	}
-
-	delete(tm.container, k)
-}
-
-// cleanUp iterates trhough the map and expires all key-value
-// pairs which expire time after the current time
-func (tm *TimedMap) cleanUp() {
-	now := time.Now()
-
-	tm.mtx.Lock()
-	defer tm.mtx.Unlock()
-
-	for k, v := range tm.container {
-		if now.After(v.expires) {
-			tm.expireElement(k.key, k.sec, v)
-		}
-	}
-}
-
-// set sets the value for a key and section with the
-// given expiration parameters
-func (tm *TimedMap) set(key interface{}, sec int, val interface{}, expiresAfter time.Duration, cb ...callback) {
-	// re-use element when existent on this key
-	if v := tm.getRaw(key, sec); v != nil {
-		v.value = val
-		v.expires = time.Now().Add(expiresAfter)
-		v.cbs = cb
+func (t *timedMap) GetValue(key interface{}) (v interface{}) {
+	vw, ok := t.get(key)
+	if !ok {
 		return
 	}
 
-	k := keyWrap{
-		sec: sec,
-		key: key,
-	}
-
-	tm.mtx.Lock()
-	defer tm.mtx.Unlock()
-
-	tm.container[k] = &element{
-		value:   val,
-		expires: time.Now().Add(expiresAfter),
-		cbs:     cb,
-	}
+	return vw.val
 }
 
-// get returns an element object by key and section
-// if the value has not already expired
-func (tm *TimedMap) get(key interface{}, sec int) *element {
-	v := tm.getRaw(key, sec)
-
-	if v == nil {
-		return nil
-	}
-
-	if time.Now().After(v.expires) {
-		tm.mtx.Lock()
-		defer tm.mtx.Unlock()
-		tm.expireElement(key, sec, v)
-		return nil
-	}
-
-	return v
-}
-
-// getRaw returns the raw element object by key,
-// not depending on expiration time
-func (tm *TimedMap) getRaw(key interface{}, sec int) *element {
-	k := keyWrap{
-		sec: sec,
-		key: key,
-	}
-
-	tm.mtx.RLock()
-	v, ok := tm.container[k]
-	tm.mtx.RUnlock()
-
+func (t *timedMap) GetExpires(key interface{}) (exp time.Time, err error) {
+	vw, ok := t.get(key)
 	if !ok {
-		return nil
+		err = ErrKeyNotFound
+		return
 	}
 
-	return v
+	exp = vw.exp
+	return
 }
 
-// remove removes an element from the map by giveb
-// key and section
-func (tm *TimedMap) remove(key interface{}, sec int) {
-	k := keyWrap{
-		sec: sec,
-		key: key,
+func (t *timedMap) SetExpire(key interface{}, d time.Duration) (err error) {
+	vw, ok := t.get(key)
+	if !ok {
+		err = ErrKeyNotFound
+		return
 	}
 
-	tm.mtx.Lock()
-	defer tm.mtx.Unlock()
+	vw.exp = time.Now().Add(d)
 
-	delete(tm.container, k)
+	return
 }
 
-// refresh extends the lifetime of the given key in the
-// given section by the duration d.
-func (tm *TimedMap) refresh(key interface{}, sec int, d time.Duration) error {
-	v := tm.get(key, sec)
-	if v == nil {
-		return ErrKeyNotFound
+func (t *timedMap) Refresh(key interface{}, d time.Duration) (err error) {
+	vw, ok := t.get(key)
+	if !ok {
+		err = ErrKeyNotFound
+		return
 	}
-	v.expires = v.expires.Add(d)
-	return nil
+
+	vw.exp = vw.exp.Add(d)
+
+	return
 }
 
-// setExpire sets the lifetime of the given key in the
-// given section to the duration d.
-func (tm *TimedMap) setExpire(key interface{}, sec int, d time.Duration) error {
-	v := tm.get(key, sec)
-	if v == nil {
-		return ErrKeyNotFound
+func (t *timedMap) Contains(key interface{}) (ok bool) {
+	_, ok = t.get(key)
+	return
+}
+
+func (t *timedMap) Remove(key interface{}) {
+	t.remove(key, nil)
+}
+
+func (t *timedMap) Flush() {
+	t.m.Range(func(key, value interface{}) bool {
+		vw, ok := value.(*valueWrapper)
+		if ok {
+			t.remove(key, vw)
+		}
+		return true
+	})
+}
+
+func (t *timedMap) Size() int {
+	return int(t.size)
+}
+
+func (t *timedMap) StartCleaner(interval time.Duration) {
+	if t.cleanupRunning {
+		t.StopCleaner()
 	}
-	v.expires = time.Now().Add(d)
-	return nil
+	t.cleanupRunning = true
+	go t.cleanupCycle(interval)
+}
+
+func (t *timedMap) StopCleaner() {
+	t.cStopCleanup <- struct{}{}
+}
+
+func (t *timedMap) get(key interface{}) (vw *valueWrapper, ok bool) {
+	_vw, ok := t.m.Load(key)
+	if !ok {
+		return
+	}
+	vw, ok = _vw.(*valueWrapper)
+	if !ok {
+		return
+	}
+
+	if time.Now().After(vw.exp) {
+		t.remove(key, vw)
+		return nil, false
+	}
+
+	return
+}
+
+func (t *timedMap) remove(key interface{}, vw *valueWrapper) {
+	if vw == nil {
+		var ok bool
+		if vw, ok = t.get(key); !ok {
+			return
+		}
+	}
+
+	if vw.cb != nil {
+		vw.cb(vw.val)
+	}
+	t.m.Delete(key)
+	t.valuePool.Put(vw)
+	atomic.AddInt64(&t.size, -1)
+}
+
+func (t *timedMap) cleanup() {
+	t.m.Range(func(key, value interface{}) bool {
+		t.get(key)
+		return true
+	})
+}
+
+func (t *timedMap) cleanupCycle(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+
+	defer func() {
+		t.cleanupRunning = false
+	}()
+
+	for {
+		select {
+		case <-ticker.C:
+			go t.cleanup()
+		case <-t.cStopCleanup:
+			ticker.Stop()
+			break
+		}
+	}
+
 }

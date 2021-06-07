@@ -1,367 +1,266 @@
 package timedmap
 
 import (
-	"sync"
 	"testing"
 	"time"
-)
 
-const (
-	dCleanupTick = 10 * time.Millisecond
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 func TestNew(t *testing.T) {
-	tm := New(dCleanupTick)
-
-	if tm == nil {
-		t.Fatal("TimedMap was nil")
-	}
-	if s := len(tm.container); s != 0 {
-		t.Fatalf("map size was %d != 0", s)
-	}
-}
-
-func TestFlush(t *testing.T) {
-	tm := New(dCleanupTick)
-
-	for i := 0; i < 10; i++ {
-		tm.set(i, 0, 1, time.Hour)
-	}
-	tm.Flush()
-	if s := len(tm.container); s > 0 {
-		t.Fatalf("size was %d > 0", s)
-	}
+	tm := New(5 * time.Second).(*timedMap)
+	assert.True(t, tm.cleanupRunning)
 }
 
 func TestSet(t *testing.T) {
-	const key = "tKeySet"
-	const val = "tValSet"
+	tm := New(5 * time.Second).(*timedMap)
+	const lifetime = 1 * time.Second
+	tm.Set("test", 1, lifetime)
+	setTime := time.Now()
 
-	tm := New(dCleanupTick)
-
-	tm.Set(key, val, 20*time.Millisecond)
-	if v := tm.get(key, 0); v == nil {
-		t.Fatal("key was not set")
-	} else if v.value.(string) != val {
-		t.Fatal("value was not like set")
-	}
-	time.Sleep(40 * time.Millisecond)
-	if v := tm.get(key, 0); v != nil {
-		t.Fatal("key was not deleted after expire")
-	}
-
-	tm.Flush()
+	_vw, _ := tm.m.Load("test")
+	vw := _vw.(*valueWrapper)
+	assert.Equal(t, 1, vw.val)
+	assert.InDelta(t,
+		setTime.Add(lifetime).UnixNano(),
+		vw.exp.UnixNano(),
+		float64(1*time.Millisecond))
+	assert.EqualValues(t, 1, tm.size)
 }
 
 func TestGetValue(t *testing.T) {
-	const key = "tKeyGetVal"
-	const val = "tValGetVal"
+	// Test Get + Expire Get + Callback
+	{
+		cb := new(cbMock)
+		cb.On("Cb").Return()
 
-	tm := New(dCleanupTick)
+		tm := New(5 * time.Second)
+		tm.Set("test", 1, 1*time.Second, cb.Cb)
 
-	tm.Set(key, val, 50*time.Millisecond)
+		v := tm.GetValue("test")
+		assert.Equal(t, 1, v)
 
-	if tm.GetValue("keyNotExists") != nil {
-		t.Fatal("non existent key was not nil")
+		time.Sleep(1 * time.Second)
+
+		v = tm.GetValue("test")
+		assert.Nil(t, v)
+
+		cb.AssertCalled(t, "Cb")
+		assert.Equal(t, 1, cb.TestData().Get("v").Int())
 	}
 
-	v := tm.GetValue(key)
-	if v == nil {
-		t.Fatal("value was nil")
-	}
-	if vStr := v.(string); vStr != val {
-		t.Fatalf("got value was %s != 'tValGetVal'", vStr)
-	}
+	// Test Expire Cleanup + Callback
+	{
+		cb := new(cbMock)
+		cb.On("Cb").Return()
 
-	time.Sleep(60 * time.Millisecond)
+		tm := New(500 * time.Millisecond).(*timedMap)
+		tm.Set("test", 1, 0, cb.Cb)
 
-	v = tm.GetValue(key)
-	if v != nil {
-		t.Fatal("key was not deleted after expiration time")
-	}
+		time.Sleep(1 * time.Second)
 
-	tm.Set(key, val, 1*time.Microsecond)
-	time.Sleep(2 * time.Millisecond)
-	if tm.GetValue(key) != nil {
-		t.Fatal("expired key was not removed by get func")
+		_, ok := tm.m.Load("test")
+		assert.False(t, ok)
+
+		cb.AssertCalled(t, "Cb")
+		assert.Equal(t, 1, cb.TestData().Get("v").Int())
 	}
 
-	tm.Flush()
+	// Test Size on double Set
+	{
+		tm := New(500 * time.Millisecond).(*timedMap)
+
+		tm.Set("test", 1, 1*time.Second)
+		assert.EqualValues(t, 1, tm.size)
+
+		tm.Set("test2", 1, 1*time.Second)
+		assert.EqualValues(t, 2, tm.size)
+
+		tm.Set("test", 3, 1*time.Second)
+		assert.EqualValues(t, 2, tm.size)
+	}
 }
 
-func TestGetExpire(t *testing.T) {
-	const key = "tKeyGetExp"
-	const val = "tValGetExp"
+func TestGetExpires(t *testing.T) {
+	tm := New(5 * time.Second)
+	const lifetime = 1 * time.Second
+	tm.Set("test", 1, lifetime)
+	setTime := time.Now()
 
-	tm := New(dCleanupTick)
+	exp, err := tm.GetExpires("test")
+	assert.Nil(t, err)
+	assert.InDelta(t,
+		setTime.Add(lifetime).UnixNano(),
+		exp.UnixNano(),
+		float64(1*time.Millisecond))
 
-	tm.Set(key, val, 50*time.Millisecond)
-	ct := time.Now().Add(50 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
-	if _, err := tm.GetExpires("keyNotExists"); err != ErrKeyNotFound {
-		t.Fatal("err was not 'key not found': ", err)
-	}
-
-	exp, err := tm.GetExpires(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d := ct.Sub(exp); d > 1*time.Millisecond {
-		t.Fatalf("expire date diff was %d > 1 millisecond", d)
-	}
-
-	tm.Flush()
+	exp, err = tm.GetExpires("test")
+	assert.EqualError(t, err, ErrKeyNotFound.Error())
 }
 
-func TestSetExpire(t *testing.T) {
-	const key = "tKeyRef"
+func TestSetExpires(t *testing.T) {
+	tm := New(5 * time.Second).(*timedMap)
+	const lifetime = 1 * time.Second
+	tm.Set("test", 1, lifetime)
 
-	tm := New(dCleanupTick)
+	time.Sleep(500 * time.Millisecond)
+	setTime := time.Now()
 
-	if err := tm.Refresh("keyNotExists", time.Hour); err == nil || err != ErrKeyNotFound {
-		t.Fatalf("error on non existing key was %v != 'key not found'", err)
-	}
+	err := tm.SetExpire("test", lifetime)
+	assert.Nil(t, err)
 
-	if err := tm.SetExpire("notExistentKey", 1*time.Second); err != ErrKeyNotFound {
-		t.Errorf("returned error should have been '%s', but was '%s'",
-			ErrKeyNotFound.Error(), err.Error())
-	}
+	_vw, _ := tm.m.Load("test")
+	vw := _vw.(*valueWrapper)
+	assert.InDelta(t,
+		setTime.Add(lifetime).UnixNano(),
+		vw.exp.UnixNano(),
+		float64(1*time.Millisecond))
 
-	tm.Set(key, 1, 12*time.Millisecond)
-	if err := tm.SetExpire(key, 50*time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(30 * time.Millisecond)
-	if v := tm.get(key, 0); v == nil {
-		t.Fatal("key was not refreshed")
-	}
-
-	time.Sleep(52 * time.Millisecond)
-	if v := tm.get(key, 0); v != nil {
-		t.Fatal("key was not deleted after refreshed time")
-	}
-
-	tm.Flush()
-}
-
-func TestContains(t *testing.T) {
-	const key = "tKeyCont"
-
-	tm := New(dCleanupTick)
-
-	tm.Set(key, 1, 30*time.Millisecond)
-
-	if tm.Contains("keyNotExists") {
-		t.Fatal("non existing key was detected as containing")
-	}
-
-	if !tm.Contains(key) {
-		t.Fatal("containing key was detected as not containing")
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	if tm.Contains(key) {
-		t.Fatal("expired key was detected as containing")
-	}
-
-	tm.Flush()
-}
-
-func TestRemove(t *testing.T) {
-	const key = "tKeyRem"
-
-	tm := New(dCleanupTick)
-
-	tm.Set(key, 1, time.Hour)
-	tm.Remove(key)
-
-	if v := tm.get(key, 0); v != nil {
-		t.Fatal("key still exists after remove")
-	}
-
-	tm.Flush()
+	err = tm.SetExpire("nonexistent", 0)
+	assert.EqualError(t, err, ErrKeyNotFound.Error())
 }
 
 func TestRefresh(t *testing.T) {
-	const key = "tKeyRef"
+	tm := New(5 * time.Second).(*timedMap)
+	const lifetime = 1 * time.Second
+	tm.Set("test", 1, lifetime)
 
-	tm := New(dCleanupTick)
+	time.Sleep(500 * time.Millisecond)
 
-	if err := tm.Refresh("keyNotExists", time.Hour); err == nil || err != ErrKeyNotFound {
-		t.Fatalf("error on non existing key was %v != 'key not found'", err)
-	}
+	_vw, _ := tm.m.Load("test")
+	vw := _vw.(*valueWrapper)
+	expBefore := vw.exp
 
-	tm.Set(key, 1, 12*time.Millisecond)
-	if err := tm.Refresh(key, 50*time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
+	err := tm.Refresh("test", lifetime)
+	assert.Nil(t, err)
 
-	time.Sleep(30 * time.Millisecond)
-	if v := tm.get(key, 0); v == nil {
-		t.Fatal("key was not refreshed")
-	}
+	_vw, _ = tm.m.Load("test")
+	vw = _vw.(*valueWrapper)
+	assert.EqualValues(t, expBefore.Add(lifetime), vw.exp)
 
-	time.Sleep(100 * time.Millisecond)
-	if v := tm.get(key, 0); v != nil {
-		t.Fatal("key was not deleted after refreshed time")
-	}
+	err = tm.Refresh("nonexistent", 0)
+	assert.EqualError(t, err, ErrKeyNotFound.Error())
+}
+
+func TestContains(t *testing.T) {
+	tm := New(5 * time.Second)
+	tm.Set("test", 1, 1*time.Second)
+
+	assert.True(t, tm.Contains("test"))
+	time.Sleep(1 * time.Second)
+	assert.False(t, tm.Contains("test"))
+}
+
+func TestRemove(t *testing.T) {
+	cb := new(cbMock)
+	cb.On("Cb").Return()
+
+	tm := New(5 * time.Second).(*timedMap)
+	tm.Set("test", 1, 1*time.Second, cb.Cb)
+	assert.EqualValues(t, 1, tm.size)
+
+	tm.Remove("test")
+	assert.EqualValues(t, 0, tm.size)
+
+	cb.AssertCalled(t, "Cb")
+	assert.Equal(t, 1, cb.TestData().Get("v").Int())
+}
+
+func TestFlush(t *testing.T) {
+	cb := new(cbMock)
+	cb.On("Cb").Return()
+
+	tm := New(5 * time.Second).(*timedMap)
+
+	tm.Set("test1", 1, 1*time.Second, cb.Cb)
+	tm.Set("test2", 1, 1*time.Second, cb.Cb)
+	tm.Set("test3", 1, 1*time.Second, cb.Cb)
+	assert.EqualValues(t, 3, tm.size)
 
 	tm.Flush()
+	assert.EqualValues(t, 0, tm.size)
+
+	_, ok := tm.m.Load("test1")
+	assert.False(t, ok)
+	_, ok = tm.m.Load("test2")
+	assert.False(t, ok)
+	_, ok = tm.m.Load("test3")
+	assert.False(t, ok)
+
+	cb.AssertNumberOfCalls(t, "Cb", 3)
 }
 
 func TestSize(t *testing.T) {
-	tm := New(dCleanupTick)
+	tm := New(5 * time.Second).(*timedMap)
+	assert.EqualValues(t, 0, tm.Size())
 
-	for i := 0; i < 25; i++ {
-		tm.Set(i, 1, 50*time.Millisecond)
-	}
-	if s := tm.Size(); s != 25 {
-		t.Fatalf("size was %d != 25", s)
-	}
+	tm.Set("test1", 1, 1*time.Second)
+	assert.EqualValues(t, 1, tm.Size())
 
-	tm.Flush()
+	tm.Set("test2", 1, 1*time.Second)
+	assert.EqualValues(t, 2, tm.Size())
+
+	tm.Set("test2", 2, 1*time.Second)
+	assert.EqualValues(t, 2, tm.Size())
+
+	tm.Set("test3", 1, 1*time.Second)
+	assert.EqualValues(t, 3, tm.Size())
 }
 
-func TestCallback(t *testing.T) {
-	tm := New(dCleanupTick)
+func TestStartCleaner(t *testing.T) {
+	var exp time.Duration
+	cleanupInterval := 500 * time.Millisecond
+	tm := New(cleanupInterval).(*timedMap)
 
-	var cbCalled bool
-	tm.Set(1, 3, 25*time.Millisecond, func(v interface{}) {
-		cbCalled = true
+	tset := time.Now()
+	tm.Set("test", 1, 0, func(value interface{}) {
+		exp = time.Since(tset)
 	})
 
-	time.Sleep(50 * time.Millisecond)
-	if !cbCalled {
-		t.Fatal("callback has not been called")
-	}
-	if v := tm.get(1, 0); v != nil {
-		t.Fatal("key was not deleted after expire time")
-	}
+	time.Sleep(1 * time.Second)
+	assert.InDelta(t,
+		cleanupInterval,
+		exp,
+		float64(100*time.Millisecond))
+
+	cleanupInterval = 1 * time.Second
+	tm.StartCleaner(1 * time.Second)
+	tset = time.Now()
+	tm.Set("test", 1, 0, func(value interface{}) {
+		exp = time.Since(tset)
+	})
+
+	time.Sleep(1500 * time.Millisecond)
+	assert.InDelta(t,
+		cleanupInterval,
+		exp,
+		float64(100*time.Millisecond))
 }
 
 func TestStopCleaner(t *testing.T) {
-	tm := New(dCleanupTick)
+	cb := new(cbMock)
+	cb.On("Cb").Return()
+
+	tm := New(500 * time.Millisecond).(*timedMap)
+	tm.Set("test1", 1, 0, cb.Cb)
 
 	tm.StopCleaner()
-	time.Sleep(10 * time.Millisecond)
-}
-
-func TestConcurrentReadWrite(t *testing.T) {
-	tm := New(dCleanupTick)
-
-	go func() {
-		for {
-			for i := 0; i < 100; i++ {
-				tm.Set(i, i, 2*time.Second)
-			}
-		}
-	}()
-
-	// Wait 10 mills before read cycle starts so that
-	// it does not start before the first values are
-	// set to the map.
-	time.Sleep(10 * time.Millisecond)
-	go func() {
-		for {
-			for i := 0; i < 100; i++ {
-				v := tm.GetValue(i)
-				if v != i {
-					t.Fatalf("recovered value %d was not %d, like expected", v, i)
-				}
-			}
-		}
-	}()
 
 	time.Sleep(1 * time.Second)
+
+	cb.AssertNotCalled(t, "Cb")
 }
 
-func TestGetExpiredConcurrent(t *testing.T) {
-	tm := New(dCleanupTick)
+//////////////
 
-	wg := sync.WaitGroup{}
-	for i := 0; i < 50000; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tm.Set(1, 1, 0)
-		}()
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tm.GetValue(1)
-		}()
-	}
-
-	wg.Wait()
+type cbMock struct {
+	mock.Mock
 }
 
-func TestExternalTicker(t *testing.T) {
-	const key = "tKeySet"
-	const val = "tValSet"
-
-	ticker := time.NewTicker(dCleanupTick)
-	tm := New(0, ticker.C)
-
-	tm.Set(key, val, 20*time.Millisecond)
-	if v := tm.get(key, 0); v == nil {
-		t.Fatal("key was not set")
-	} else if v.value.(string) != val {
-		t.Fatal("value was not like set")
-	}
-	time.Sleep(40 * time.Millisecond)
-	if v := tm.get(key, 0); v != nil {
-		t.Fatal("key was not deleted after expire")
-	}
-}
-
-func TestBeforeCleanup(t *testing.T) {
-	const key, value = 1, 2
-
-	tm := New(1 * time.Hour)
-
-	tm.Set(key, value, 5*time.Millisecond)
-
-	time.Sleep(10 * time.Millisecond)
-
-	_, ok := tm.GetValue(key).(int)
-	if ok {
-		t.Fatal("value got recovered but should have been expired")
-	}
-}
-
-// ----------------------------------------------------------
-// --- BENCHMARKS ---
-
-func BenchmarkSetValues(b *testing.B) {
-	tm := New(1 * time.Minute)
-	for n := 0; n < b.N; n++ {
-		tm.Set(n, n, 1*time.Hour)
-	}
-}
-
-func BenchmarkSetGetValues(b *testing.B) {
-	tm := New(1 * time.Minute)
-	for n := 0; n < b.N; n++ {
-		tm.Set(n, n, 1*time.Hour)
-		tm.GetValue(n)
-	}
-}
-
-func BenchmarkSetGetRemoveValues(b *testing.B) {
-	tm := New(1 * time.Minute)
-	for n := 0; n < b.N; n++ {
-		tm.Set(n, n, 1*time.Hour)
-		tm.GetValue(n)
-		tm.Remove(n)
-	}
-}
-
-func BenchmarkSetGetSameKey(b *testing.B) {
-	tm := New(1 * time.Minute)
-	for n := 0; n < b.N; n++ {
-		tm.Set(1, n, 1*time.Hour)
-		tm.GetValue(1)
-	}
+func (cb *cbMock) Cb(v interface{}) {
+	cb.TestData().Set("v", v)
+	cb.Called()
 }
