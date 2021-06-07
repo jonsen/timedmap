@@ -264,3 +264,38 @@ func (cb *cbMock) Cb(v interface{}) {
 	cb.TestData().Set("v", v)
 	cb.Called()
 }
+
+////////////////
+// BENCHMARKS
+
+func BenchmarkSetValues(b *testing.B) {
+	tm := New(1 * time.Minute)
+	for n := 0; n < b.N; n++ {
+		tm.Set(n, n, 1*time.Hour)
+	}
+}
+
+func BenchmarkSetGetValues(b *testing.B) {
+	tm := New(1 * time.Minute)
+	for n := 0; n < b.N; n++ {
+		tm.Set(n, n, 1*time.Hour)
+		tm.GetValue(n)
+	}
+}
+
+func BenchmarkSetGetRemoveValues(b *testing.B) {
+	tm := New(1 * time.Minute)
+	for n := 0; n < b.N; n++ {
+		tm.Set(n, n, 1*time.Hour)
+		tm.GetValue(n)
+		tm.Remove(n)
+	}
+}
+
+func BenchmarkSetGetSameKey(b *testing.B) {
+	tm := New(1 * time.Minute)
+	for n := 0; n < b.N; n++ {
+		tm.Set(1, n, 1*time.Hour)
+		tm.GetValue(1)
+	}
+}
