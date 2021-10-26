@@ -4,7 +4,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/zekroTJA/timedmap"
+	"github.com/jonsen/timedmap"
 )
 
 func main() {
