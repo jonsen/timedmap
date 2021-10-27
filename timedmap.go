@@ -33,6 +33,7 @@ type keyWrap struct {
 type element struct {
 	value   interface{}
 	expires time.Time
+	expired bool
 	cbs     []callback
 }
 
@@ -257,7 +258,7 @@ func (tm *TimedMap) cleanUp() {
 	defer tm.mtx.Unlock()
 
 	for k, v := range tm.container {
-		if now.After(v.expires) {
+		if v.expired && now.After(v.expires) {
 			tm.expireElement(k.key, k.sec, v)
 		}
 	}
@@ -269,8 +270,11 @@ func (tm *TimedMap) set(key interface{}, sec int, val interface{}, expiresAfter 
 	// re-use element when existent on this key
 	if v := tm.getRaw(key, sec); v != nil {
 		v.value = val
-		v.expires = time.Now().Add(expiresAfter)
 		v.cbs = cb
+		if expiresAfter > 0 {
+			v.expired = true
+			v.expires = time.Now().Add(expiresAfter)
+		}
 		return
 	}
 
@@ -284,7 +288,10 @@ func (tm *TimedMap) set(key interface{}, sec int, val interface{}, expiresAfter 
 
 	v := tm.elementPool.Get().(*element)
 	v.value = val
-	v.expires = time.Now().Add(expiresAfter)
+	if expiresAfter > 0 {
+		v.expired = true
+		v.expires = time.Now().Add(expiresAfter)
+	}
 	v.cbs = cb
 	tm.container[k] = v
 }
@@ -298,7 +305,7 @@ func (tm *TimedMap) get(key interface{}, sec int) *element {
 		return nil
 	}
 
-	if time.Now().After(v.expires) {
+	if v.expired && time.Now().After(v.expires) {
 		tm.mtx.Lock()
 		defer tm.mtx.Unlock()
 		tm.expireElement(key, sec, v)
@@ -354,7 +361,12 @@ func (tm *TimedMap) refresh(key interface{}, sec int, d time.Duration) error {
 	if v == nil {
 		return ErrKeyNotFound
 	}
-	v.expires = v.expires.Add(d)
+	if d > 0 {
+		v.expired = true
+		v.expires = v.expires.Add(d)
+	} else {
+		v.expired = false
+	}
 	return nil
 }
 
@@ -365,7 +377,12 @@ func (tm *TimedMap) setExpires(key interface{}, sec int, d time.Duration) error 
 	if v == nil {
 		return ErrKeyNotFound
 	}
-	v.expires = time.Now().Add(d)
+	if d > 0 {
+		v.expired = true
+		v.expires = v.expires.Add(d)
+	} else {
+		v.expired = false
+	}
 	return nil
 }
 
